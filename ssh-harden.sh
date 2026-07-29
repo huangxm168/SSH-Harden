@@ -152,6 +152,42 @@ EOF
 }
 
 # ------------------------------------------------------------------ 参数解析 --
+# 需要接参数的短选项
+readonly OPTS_WITH_ARG="gufp"
+
+# 展开组合短选项，兼容 getopts 的传统写法。很多一键脚本的用户已习惯这么写，
+# 旧命令还可能被固化在短链接、文档或运维手册里，不应因换了实现方式而失效：
+#   -ou <URL>    → -o -u <URL>
+#   -p54278      → -p 54278
+#   -op54278     → -o -p 54278
+#   -dn          → -d -n
+# 规则与 getopts 一致：从左往右逐字符展开，一旦遇到需要接参数的选项，
+# 其后剩余字符即作为该选项的值（无剩余则由 parse_args 取下一个参数）。
+EXPANDED_ARGS=()
+expand_short_opts() {
+    EXPANDED_ARGS=()
+    local arg i c rest
+    for arg in "$@"; do
+        # 长选项（--xxx）、单个 -、以及非选项参数，一律原样保留
+        if [[ "$arg" == --* ]] || [[ "$arg" != -?* ]]; then
+            EXPANDED_ARGS+=("$arg")
+            continue
+        fi
+        i=1
+        while [ "$i" -lt "${#arg}" ]; do
+            c="${arg:i:1}"
+            if [[ "$OPTS_WITH_ARG" == *"$c"* ]]; then
+                rest="${arg:i+1}"
+                EXPANDED_ARGS+=("-$c")
+                [ -n "$rest" ] && EXPANDED_ARGS+=("$rest")
+                break
+            fi
+            EXPANDED_ARGS+=("-$c")
+            i=$((i + 1))
+        done
+    done
+}
+
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -878,7 +914,8 @@ print_summary() {
 
 # ------------------------------------------------------------------ 主流程 --
 main() {
-    parse_args "$@"
+    expand_short_opts "$@"
+    parse_args "${EXPANDED_ARGS[@]}"
     require_root
     check_prerequisites
     detect_ssh_unit

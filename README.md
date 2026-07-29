@@ -87,6 +87,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/huangxm168/SSH-Harden/main/s
 | `--force` | 跳过「当前会话是否密钥登录」的确认（危险） |
 | `--rollback` | 从最近备份还原并重启服务 |
 
+短选项兼容 `getopts` 的传统写法，组合与粘连均可：`-ou <URL>` 等价于 `-o -u <URL>`，`-p54278` 等价于 `-p 54278`。
+
 ## 安全设计
 
 ### 一、禁用密码前的三重证据
@@ -143,7 +145,7 @@ sshd 的配置优先级相当微妙：`Include` 指令的位置、drop-in 文件
 
 ## 测试
 
-在 Debian 12 容器中完成端到端验证，26 项断言全部通过，包括：
+在 Debian 12 容器中完成端到端验证，29 项断言全部通过，包括：
 
 - 复现商家镜像场景（出厂 `PubkeyAuthentication no`），验证脚本能自动开启密钥认证
 - 验证 drop-in 确实压过主配置中的冲突项
