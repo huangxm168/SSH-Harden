@@ -14,7 +14,7 @@
 
 set -Eeuo pipefail
 
-readonly HARDEN_VERSION="3.1.0"
+readonly HARDEN_VERSION="3.2.0"
 readonly PROG="${0##*/}"
 
 # ------------------------------------------------------------------ 路径常量 --
@@ -60,6 +60,9 @@ else
     readonly C_RED='' C_GRN='' C_YEL='' C_CYA='' C_DIM='' C_RST=''
 fi
 
+readonly CONFIRM_RULE="──────────────────────────────────────────────────────"
+readonly CONFIRM_MAX_TRIES=3
+
 info() { printf '%s[INFO]%s %s\n'  "$C_GRN" "$C_RST" "$*"; }
 warn() { printf '%s[WARN]%s %s\n'  "$C_YEL" "$C_RST" "$*" >&2; }
 erro() { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
@@ -79,7 +82,7 @@ die() {
         set +e
         erro "已产生改动，正在回滚..."
         restore_from "$BACKUP_DIR"
-        erro "已回滚到执行前的状态"
+        erro "已回滚到执行前的状态：SSH 配置与现有连接均未改变，可放心重试"
     fi
     exit 1
 }
@@ -252,8 +255,15 @@ detect_os() {
     id_like="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")"
 
     if [[ ! "${id_like} ${id}" =~ (debian|ubuntu) ]]; then
-        warn "本脚本主要针对 Debian 12 / 13 测试，当前系统: ${pretty:-未知}"
-        confirm "是否仍要继续？" || die "已取消"
+        # 此时尚未产生任何改动，选 n 是直接退出而非回滚，措辞要如实反映
+        confirm \
+"本脚本主要针对 Debian 12 / 13 测试，当前系统是 ${pretty:-未知}。
+其他发行版的 sshd 配置结构、服务单元名称与防火墙工具都可能不同，
+脚本的自我校验未必覆盖得到。" \
+            "是否仍要在此系统上继续？" \
+            "继续执行（风险自负）" \
+            "退出，不做任何改动" \
+            || die "已取消，未做任何改动"
     fi
     note "系统: ${pretty:-未知}"
 }
@@ -343,16 +353,87 @@ sshd_effective() {
     sshd -T 2>/dev/null | awk -v k="$key" 'tolower($1)==k && !seen {print $2; seen=1}'
 }
 
+# 交互确认。调用方必须同时说明「选 y 会怎样」「选 n 会怎样」——
+# 这类提示只出现在高危操作前，用户看不懂就只能瞎猜，而猜错的代价是锁死或整单回滚。
+#
+# 提示整体分多行输出、每行都带换行符：既醒目，也不会因为「光标停在未结束的行尾」
+# 而在网页控制台复制日志时整行丢失。至于提示为什么必须自己 printf 而不能用
+# read -p，见下面循环里的说明——那才是它此前根本不显示的原因。
+#
+# 用法: confirm <上下文说明(可多行, 可为空)> <问题> <选 y 的后果> <选 n 的后果>
 confirm() {
-    local prompt="$1"
+    local context="$1" question="$2" yes_desc="$3" no_desc="$4"
     [ "$ASSUME_YES" -eq 1 ] && return 0
     [ "$DRY_RUN" -eq 1 ] && return 0
-    local reply
-    if ! read -r -p "${prompt} [y/N] " reply < /dev/tty 2>/dev/null; then
-        warn "无法读取终端输入，视为拒绝（自动化场景请加 --yes）"
-        return 1
+
+    # 整块走 stderr：与 read -p 的提示同流，顺序不会因缓冲差异而错乱
+    local line
+    {
+        printf '\n  %s%s%s\n' "$C_YEL" "$CONFIRM_RULE" "$C_RST"
+        printf '  %s需要你确认%s\n'  "$C_YEL" "$C_RST"
+        printf '  %s%s%s\n'   "$C_YEL" "$CONFIRM_RULE" "$C_RST"
+        if [ -n "$context" ]; then
+            while IFS= read -r line; do printf '  %s\n' "$line"; done <<< "$context"
+            printf '\n'
+        fi
+        printf '  %s%s%s\n\n' "$C_CYA" "$question" "$C_RST"
+        printf '    y / yes   %s\n' "$yes_desc"
+        printf '    n / no    %s（直接回车同此）\n' "$no_desc"
+        printf '  %s%s%s\n' "$C_YEL" "$CONFIRM_RULE" "$C_RST"
+    } >&2
+
+    # 只有「无法识别的输入」才重试；空输入是明确的拒绝，不再追问
+    local reply try=0
+    while [ "$try" -lt "$CONFIRM_MAX_TRIES" ]; do
+        try=$((try + 1))
+        # 提示必须自己 printf，不能用 read -p：read -p 的提示同样写 stderr，
+        # 而为了压掉 /dev/tty 不存在时的报错必须带 2>/dev/null，那会把提示一并吞掉，
+        # 用户看到的就是脚本无声挂起、不知道在等什么——这正是 3.1.0 及之前的真实表现。
+        printf '  %s请输入 [y/n]: %s' "$C_CYA" "$C_RST" >&2
+        if ! read -r reply < /dev/tty 2>/dev/null; then
+            printf '\n' >&2
+            warn "检测不到终端输入，已按取消处理"
+            note "自动化场景请加 --yes（使用前请确认你已了解上述风险）" >&2
+            return 1
+        fi
+        case "$reply" in
+            y|Y|yes|YES|Yes) return 0 ;;
+            n|N|no|NO|No|"") return 1 ;;
+            *)
+                [ "$try" -lt "$CONFIRM_MAX_TRIES" ] &&
+                    warn "无法识别的输入「${reply}」，请输入 y 或 n"
+                ;;
+        esac
+    done
+    warn "连续 ${CONFIRM_MAX_TRIES} 次无法识别输入，已按取消处理"
+    return 1
+}
+
+# 动手前先把「将要发生什么」摊开说清楚，避免用户执行到一半才反应过来。
+# 只打印、不拦截：加一道确认会让交互式使用多一次打断，而 -y 场景下又形同虚设。
+print_plan() {
+    step "执行计划"
+    local n=0
+    if [ ${#PUB_KEYS[@]} -gt 0 ]; then
+        n=$((n + 1))
+        note "${n}. 安装 ${#PUB_KEYS[@]} 个公钥到用户 ${TARGET_USER}$([ "$OVERWRITE" -eq 1 ] && printf '（覆盖模式，会清空原有内容）')"
     fi
-    [[ "$reply" =~ ^[Yy]$ ]]
+    if [ -n "$SSH_PORT" ]; then
+        n=$((n + 1))
+        local cur_port; cur_port="$(sshd_effective port)"
+        note "${n}. 修改 SSH 端口: ${cur_port:-未知} → ${SSH_PORT}"
+        if [ "$SKIP_FIREWALL" -eq 1 ]; then
+            note "   （已指定 --no-firewall，不会自动放行防火墙，请自行确认端口可达）"
+        else
+            n=$((n + 1))
+            note "${n}. 放行防火墙 ${SSH_PORT}/tcp"
+        fi
+    fi
+    if [ "$DISABLE_PASSWORD" -eq 1 ]; then
+        n=$((n + 1))
+        note "${n}. 禁用密码登录（执行前会强制校验密钥可用，不满足则中止并回滚）"
+    fi
+    note "改动前会自动备份，任一环节失败自动回滚；随时可用 ${PROG} --rollback 还原"
 }
 
 # ------------------------------------------------------------------ 备份还原 --
@@ -559,8 +640,16 @@ install_keys() {
     ssh_dir="$(dirname "$akf")"
 
     if [ "$OVERWRITE" -eq 1 ] && [ -s "$akf" ]; then
-        warn "覆盖模式将清空 ${akf} 中已有的 $(grep -cve '^\s*$' "$akf" 2>/dev/null || echo 0) 行内容"
-        confirm "确认覆盖？" || die "已取消"
+        local old_lines
+        old_lines="$(grep -cve '^\s*$' "$akf" 2>/dev/null || echo 0)"
+        confirm \
+"覆盖模式（-o）会先清空 ${akf} 中已有的 ${old_lines} 行内容，再写入本次获取的公钥。
+其他人或其他设备的公钥若在其中，将一并失效。
+原文件已备份到 ${BACKUP_DIR}/authorized_keys，事后可用 ${PROG} --rollback 还原。" \
+            "确认清空原有内容并写入新公钥？" \
+            "清空后写入本次公钥" \
+            "取消并回滚全部改动" \
+            || die "已取消。如果只是想追加公钥而非替换，去掉 -o 重新执行即可"
     fi
 
     if [ "$DRY_RUN" -eq 0 ]; then
@@ -801,9 +890,15 @@ open_firewall_port() {
             info "firewalld: 已放行 ${SSH_PORT}/tcp"
             ;;
         nftables|iptables)
-            warn "检测到 ${fw} 且存在过滤规则，但自动改写规则风险较高，未自动放行"
-            warn "请手动确认 ${SSH_PORT}/tcp 已放行，否则改端口后将无法连接"
-            confirm "确认 ${SSH_PORT}/tcp 已放行并继续？" || die "已取消"
+            confirm \
+"检测到 ${fw} 且存在过滤规则，但自动改写这类规则风险太高，脚本不会代劳。
+若 ${SSH_PORT}/tcp 实际没有放行，改完端口重启服务的瞬间就会失联。
+
+建议：另开一个终端手动放行 ${SSH_PORT}/tcp，确认无误后再回来选 y。" \
+                "${SSH_PORT}/tcp 是否已经放行？" \
+                "已放行，继续修改端口" \
+                "取消并回滚全部改动" \
+                || die "已取消。请先手动放行 ${SSH_PORT}/tcp 后重试；若确认无需放行，可加 --no-firewall"
             ;;
         none)
             note "未检测到启用中的防火墙，无需放行"
@@ -880,26 +975,45 @@ assert_key_auth_ready() {
             note "✓ 当前 SSH 会话即通过密钥认证登录，密钥链路已确认可用"
             ;;
         password)
-            warn "当前 SSH 会话是通过【密码】登录的，脚本无法确认你的密钥确实可用"
-            warn "若密钥实际不可用，禁用密码后将彻底失去 SSH 访问（只能通过 VNC 控制台救援）"
-            if [ "$FORCE" -eq 0 ]; then
-                note "建议：另开一个终端用密钥登录成功后，再执行本操作"
-                confirm "确认密钥已验证可用，继续禁用密码？" \
-                    || die "已取消（可先用密钥登录后重试，或使用 --force 跳过此检查）"
+            if [ "$FORCE" -eq 1 ]; then
+                warn "当前会话是密码登录，脚本无法确认密钥可用；但已指定 --force，跳过确认"
             else
-                warn "--force 已指定，跳过确认"
+                confirm \
+"当前 SSH 会话是通过【密码】登录的，脚本无法确认你的密钥确实可用。
+若密钥实际不可用，禁用密码后你将彻底失去 SSH 访问，只能通过 VNC 控制台救援。
+
+建议：另开一个终端用密钥登录成功，然后在那个会话里重新执行本命令——
+脚本会自动识别出你已是密钥登录，届时不再询问。" \
+                    "是否继续禁用密码登录？" \
+                    "继续禁用（我已确认密钥可用）" \
+                    "取消并回滚全部改动" \
+                    || die "已取消。建议先用密钥登录成功后再重试；确有把握也可用 --force 跳过此检查"
             fi
             ;;
         *)
+            # 这两种情形的共同点是「拿不到证据」，而非「证据表明有问题」，
+            # 所以更要把话说清楚：用户看到的往往只有一句 warn，不知道自己该干什么
+            local why
             if [ -z "${SSH_CONNECTION:-}" ]; then
-                warn "当前不在 SSH 会话中（本地控制台 / 容器），无法验证密钥登录链路是否真的通"
+                why="当前不在 SSH 会话中（本地控制台 / 容器），脚本无法验证你的密钥登录链路是否真的通。"
             else
                 # Debian 13 起默认不再安装 rsyslog，/var/log/auth.log 不存在，
                 # 只剩 journald 一条路；若 journal 也读不到就只能靠人工确认
-                warn "无法从日志判断当前会话的认证方式（journald 无相关记录，且无 /var/log/auth.log）"
+                why="无法从日志判断当前会话的认证方式（journald 无相关记录，且无 /var/log/auth.log）。"
             fi
-            if [ "$FORCE" -eq 0 ]; then
-                confirm "确认密钥已验证可用，继续禁用密码？" || die "已取消"
+            if [ "$FORCE" -eq 1 ]; then
+                warn "${why}但已指定 --force，跳过确认"
+            else
+                confirm \
+"${why}
+若密钥实际不可用，禁用密码后你将彻底失去 SSH 访问，只能通过 VNC 控制台救援。
+
+建议：先去掉 -d 执行一次（只装密钥、改端口），用密钥登录成功后，
+再在那个 SSH 会话里加上 -d 重新执行——脚本届时能自动确认密钥可用，不再询问。" \
+                    "是否继续禁用密码登录？" \
+                    "继续禁用（我已确认密钥可用）" \
+                    "取消并回滚全部改动" \
+                    || die "已取消。建议先去掉 -d 装好密钥并实际登录验证，再回来执行禁用密码"
             fi
             ;;
     esac
@@ -1041,6 +1155,7 @@ main() {
 
     collect_keys
     build_desired_config
+    print_plan
 
     # 从这里开始产生实际改动，启用出错自动回滚
     create_backup

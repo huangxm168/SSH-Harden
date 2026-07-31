@@ -168,6 +168,64 @@ bash "$SCRIPT" --version >/dev/null 2>&1 && ok "长选项不受展开逻辑影�
                                          || bad "长选项被破坏"
 
 #===============================================================================
+head_ "测试 9：交互确认的可见性与输入处理"
+# 起因：confirm() 曾用 read -r -p "..." reply < /dev/tty 2>/dev/null，
+# 而 read -p 的提示恰好也写 stderr，被那个 2>/dev/null 一并吞掉，
+# 用户看到的是脚本无声挂起、不知道在等什么，只能瞎按一个键。
+# 这些用例守的就是「提示必须真的被打印出来，且说清楚每个选项的后果」。
+if ! command -v script >/dev/null 2>&1; then
+    printf '  \033[33m-\033[0m 缺少 script 命令（util-linux），跳过交互测试\n'
+else
+    reset_state() {
+        cp /tmp/sshd_config.origin /etc/ssh/sshd_config
+        rm -f /etc/ssh/sshd_config.d/10-ssh-harden.conf
+        rm -rf /var/backups/ssh-harden
+    }
+    # confirm 读的是 /dev/tty，管道喂不进去，必须借 script 造一个伪终端
+    ask() {
+        reset_state
+        printf '%b' "$1" | script -qec "bash $SCRIPT -f /tmp/testkey.pub -d" /dev/null 2>&1 \
+            | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r$//'
+    }
+    eff_pw() { sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}'; }
+
+    OUT9="$(ask '\n')"
+    grep -q '请输入 \[y/n\]' <<< "$OUT9" \
+        && ok "★ 确认提示真的被打印出来（守 read -p 提示被 2>/dev/null 吞掉的回归）" \
+        || bad "★ 确认提示不可见 —— 用户会看到脚本无声挂起"
+    grep -q 'y / yes' <<< "$OUT9" && grep -q 'n / no' <<< "$OUT9" \
+        && ok "两个选项及其后果都已列出" || bad "选项说明缺失"
+    grep -q '直接回车同此' <<< "$OUT9" \
+        && ok "明确告知「直接回车 = 取消」" || bad "未说明回车的含义"
+    grep -q '建议：' <<< "$OUT9" \
+        && ok "给出了「该怎么做才能满足条件」的建议" || bad "缺少行动建议"
+    [ "$(eff_pw)" = "yes" ] \
+        && ok "回车＝取消并回滚，密码认证未被误关" || bad "回车后密码认证变成 $(eff_pw)"
+
+    ask 'yes\n' >/dev/null
+    [ "$(eff_pw)" = "no" ] && ok "输入 yes 被正确接受（旧实现只认单字符 y）" \
+                           || bad "输入 yes 未被接受，密码认证为 $(eff_pw)"
+
+    ask 'n\n' >/dev/null
+    [ "$(eff_pw)" = "yes" ] && ok "输入 n 取消并回滚" || bad "输入 n 后密码认证为 $(eff_pw)"
+
+    OUT9R="$(ask 'xyz\ny\n')"
+    grep -q '无法识别的输入' <<< "$OUT9R" \
+        && ok "无法识别的输入会提示并重新询问" || bad "未提示重新输入"
+    [ "$(eff_pw)" = "no" ] && ok "重试后输入 y 正常继续（不再一错就中止）" \
+                           || bad "重试失败，密码认证为 $(eff_pw)"
+
+    OUT9B="$(ask 'a\nb\nc\n')"
+    grep -q '连续 3 次无法识别输入' <<< "$OUT9B" \
+        && ok "连续 3 次无效输入后按取消处理并说明原因" || bad "多次无效输入的处理不明确"
+    [ "$(eff_pw)" = "yes" ] && ok "该场景同样完成回滚" || bad "未回滚，密码认证为 $(eff_pw)"
+
+    grep -q '执行计划' <<< "$OUT9" \
+        && ok "动手前打印了执行计划预告" || bad "缺少执行计划预告"
+    reset_state
+fi
+
+#===============================================================================
 printf '\n\033[36m===== 结果 =====\033[0m\n'
 printf '  通过: \033[1;32m%d\033[0m   失败: \033[31m%d\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] && printf '  \033[1;32m全部测试通过\033[0m\n' || printf '  \033[31m存在失败项\033[0m\n'
