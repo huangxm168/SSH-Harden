@@ -2,7 +2,7 @@
 #===============================================================================
 # ssh-harden
 #
-# 在 Debian / Ubuntu 上安装 SSH 公钥、修改端口、放行防火墙、禁用密码登录。
+# 在 Debian 12 / 13 上安装 SSH 公钥、修改端口、放行防火墙、禁用密码登录。
 # 全程自我校验，任何环节失败自动回滚，避免把自己关在服务器外面。
 #
 # https://github.com/huangxm168/SSH-Harden
@@ -14,7 +14,7 @@
 
 set -Eeuo pipefail
 
-readonly HARDEN_VERSION="3.0.0"
+readonly HARDEN_VERSION="3.1.0"
 readonly PROG="${0##*/}"
 
 # ------------------------------------------------------------------ 路径常量 --
@@ -42,7 +42,13 @@ PUB_KEYS=()             # 校验通过的公钥文本
 BACKUP_DIR=""
 TRANSACTION=0           # 置 1 后出错才触发自动回滚
 SSH_UNIT=""             # ssh 或 sshd
-SOCKET_ACTIVATED=0
+# socket 激活需要区分两种状态，只看其中一种都会出事：
+#   SOCKET_ACTIVE  当前端口由 ssh.socket 持有，sshd_config 的 Port 完全无效
+#   SOCKET_ENABLED 现在可能没在监听，但下次开机 ssh.socket 会接管端口
+# 只判断 ACTIVE 会漏掉 enabled-but-inactive 的机器：改端口当场看着是成功的，
+# 一重启 socket 就把端口抢回默认值，配合防火墙只放行新端口即彻底失联。
+SOCKET_ACTIVE=0
+SOCKET_ENABLED=0
 ROLLED_BACK=0
 
 # ------------------------------------------------------------------ 输出函数 --
@@ -143,6 +149,9 @@ ssh-harden ${HARDEN_VERSION}
 设计说明:
   * 所有改动写入 ${DROPIN_FILE}，不污染主配置文件；
     若检测到 drop-in 未生效，自动回退为修改主配置文件。
+  * 检测到 ssh.socket 已启用时（Ubuntu 22.10+ 默认如此），端口改为写入
+    ${SOCKET_DROPIN_FILE}；
+    即使它当前未监听也一并写入，避免重启后端口回退到旧值。
   * 每次改动前自动备份到 ${BACKUP_ROOT}/<时间戳>/。
   * 重启服务前执行 sshd -t 语法校验，重启后用 sshd -T 核对生效值，
     任一环节失败自动回滚。
@@ -243,7 +252,7 @@ detect_os() {
     id_like="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")"
 
     if [[ ! "${id_like} ${id}" =~ (debian|ubuntu) ]]; then
-        warn "本脚本主要针对 Debian / Ubuntu 测试，当前系统: ${pretty:-未知}"
+        warn "本脚本主要针对 Debian 12 / 13 测试，当前系统: ${pretty:-未知}"
         confirm "是否仍要继续？" || die "已取消"
     fi
     note "系统: ${pretty:-未知}"
@@ -261,11 +270,26 @@ detect_ssh_unit() {
     [ -n "$SSH_UNIT" ] || die "找不到 ssh.service 或 sshd.service"
 
     if systemctl is-active --quiet ssh.socket 2>/dev/null; then
-        SOCKET_ACTIVATED=1
-        note "SSH 服务单元: ${SSH_UNIT}.service (socket 激活模式)"
-    else
-        note "SSH 服务单元: ${SSH_UNIT}.service"
+        SOCKET_ACTIVE=1
+        SOCKET_ENABLED=1
+        note "SSH 服务单元: ${SSH_UNIT}.service (socket 激活模式，端口由 ssh.socket 决定)"
+        return 0
     fi
+
+    # is-enabled 对 enabled / enabled-runtime 均返回 0，静态单元则另说，
+    # 这里只关心「开机会不会被拉起来」，故统一按前缀匹配
+    local sock_state
+    sock_state="$(systemctl is-enabled ssh.socket 2>/dev/null || true)"
+    case "$sock_state" in
+        enabled*)
+            SOCKET_ENABLED=1
+            note "SSH 服务单元: ${SSH_UNIT}.service"
+            warn "ssh.socket 已启用但当前未监听，重启后它会接管端口"
+            ;;
+        *)
+            note "SSH 服务单元: ${SSH_UNIT}.service"
+            ;;
+    esac
 }
 
 check_prerequisites() {
@@ -273,6 +297,39 @@ check_prerequisites() {
     command -v sshd       >/dev/null 2>&1 || miss+=("openssh-server")
     command -v ssh-keygen >/dev/null 2>&1 || miss+=("openssh-client")
     [ ${#miss[@]} -eq 0 ] || die "缺少依赖: ${miss[*]}"
+
+    if [ ! -d /run/sshd ]; then
+        ensure_runtime_dir || die "无法创建 /run/sshd（sshd 特权分离目录）"
+        note "已补建缺失的 /run/sshd（sshd 特权分离目录）"
+    fi
+}
+
+# sshd 启动时会检查特权分离目录，缺失则 sshd -t / -T 一律以 255 退出：
+#   Missing privilege separation directory: /run/sshd
+# 该目录由 ssh.service 的 RuntimeDirectory= 创建，systemd 会在服务停止时回收它。
+# 两种情况下它都会不在：socket 激活模式下 sshd 按需启动、空闲时本就没在跑；
+# 以及本脚本自己 stop ssh.service 之后。后者尤其阴险——sshd -T 取不到任何值，
+# verify_effective_config 会把「配置其实完全正确」误判成未生效并触发回滚。
+# 因此这里保持静默且可反复调用，在每次碰 sshd 之前兜一道底。
+# /run 是 tmpfs 上的运行时目录，创建它不算配置改动，dry-run 下同样需要，
+# 否则预演阶段的 sshd -T 全数失败，等于什么都验不了。
+ensure_runtime_dir() {
+    [ -d /run/sshd ] && return 0
+    mkdir -p /run/sshd 2>/dev/null || return 1
+    chmod 0755 /run/sshd 2>/dev/null || true
+    return 0
+}
+
+# 在动任何配置之前先确认 sshd 当前配置是可解析的。
+# 否则后续每一次 sshd -T 都会失败，触发一连串莫名其妙的回滚与误导性报错。
+check_sshd_healthy() {
+    ensure_runtime_dir || true
+    local out rc=0
+    out="$(sshd -t 2>&1)" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    erro "sshd 现有配置未通过语法校验，脚本不能在此基础上安全工作:"
+    printf '  %s\n' "$out" >&2
+    die "请先手动修复上述问题（或执行 ${PROG} --rollback 还原）后重试"
 }
 
 # 读取 sshd 当前实际生效的配置值（比读配置文件可靠）
@@ -281,6 +338,8 @@ check_prerequisites() {
 # 这里改用标志位只取第一个匹配，并把输入读完。
 sshd_effective() {
     local key="$1"
+    # 兜底必须静默：本函数的返回值靠 stdout 传递，任何提示都会污染取到的值
+    ensure_runtime_dir || true
     sshd -T 2>/dev/null | awk -v k="$key" 'tolower($1)==k && !seen {print $2; seen=1}'
 }
 
@@ -367,9 +426,9 @@ restore_from() {
         note "已还原 $akf"
     fi
 
+    ensure_runtime_dir || true
     if run sshd -t; then
-        run systemctl restart "${SSH_UNIT}.service"
-        [ "$SOCKET_ACTIVATED" -eq 1 ] && run systemctl restart ssh.socket
+        restart_ssh_stack
         info "服务已重启，还原完成"
     else
         die "还原后的配置仍未通过语法校验，请手动检查（可能需要通过 VNC 控制台介入）"
@@ -659,6 +718,7 @@ apply_sshd_config() {
     [ "$DRY_RUN" -eq 1 ] && return 0
 
     # 语法必须先过，否则 sshd -T 无意义
+    ensure_runtime_dir || true
     sshd -t 2>/dev/null || die "写入 drop-in 后语法校验失败"
 
     local bad
@@ -672,11 +732,16 @@ apply_sshd_config() {
 
 # ------------------------------------------------------ socket 激活端口处理 --
 apply_socket_port() {
-    [ "$SOCKET_ACTIVATED" -eq 1 ] || return 0
+    # 只要 ssh.socket 已启用就得改，哪怕它当前没在监听——否则重启后端口回退
+    [ "$SOCKET_ENABLED" -eq 1 ] || return 0
     [ -n "$SSH_PORT" ] || return 0
 
     step "配置 ssh.socket 监听端口"
-    warn "当前为 socket 激活模式，sshd_config 的 Port 指令会被忽略，需修改 socket 单元"
+    if [ "$SOCKET_ACTIVE" -eq 1 ]; then
+        warn "当前为 socket 激活模式，sshd_config 的 Port 指令会被忽略，需修改 socket 单元"
+    else
+        warn "ssh.socket 已启用（当前未监听），同步修改 socket 单元，避免重启后端口回退"
+    fi
 
     local content="[Socket]
 # Managed by ssh-harden ${HARDEN_VERSION}
@@ -826,7 +891,13 @@ assert_key_auth_ready() {
             fi
             ;;
         *)
-            warn "无法判断当前会话的认证方式（可能不在 SSH 会话中，或日志不可读）"
+            if [ -z "${SSH_CONNECTION:-}" ]; then
+                warn "当前不在 SSH 会话中（本地控制台 / 容器），无法验证密钥登录链路是否真的通"
+            else
+                # Debian 13 起默认不再安装 rsyslog，/var/log/auth.log 不存在，
+                # 只剩 journald 一条路；若 journal 也读不到就只能靠人工确认
+                warn "无法从日志判断当前会话的认证方式（journald 无相关记录，且无 /var/log/auth.log）"
+            fi
             if [ "$FORCE" -eq 0 ]; then
                 confirm "确认密钥已验证可用，继续禁用密码？" || die "已取消"
             fi
@@ -835,28 +906,57 @@ assert_key_auth_ready() {
 }
 
 # ---------------------------------------------------------- 服务重启与验证 --
+# socket 激活模式下的重启顺序是唯一正确解，顺序反了必然失败：
+# 先 restart ssh.service 会让 sshd 自己抢占端口，随后 systemd 拒绝 socket 重新监听
+#   ssh.socket: Socket service ssh.service already active, refusing.
+#   Failed to listen on ssh.socket
+# 结果是新端口从未生效。必须先 stop 服务把端口让出来，再让 socket 重新 bind。
+# ssh.service 带 KillMode=process，停掉 listener 不会断开已建立的 SSH 会话；
+# socket 模式下也无需再 start 服务，来一个连接 systemd 自会拉起。
+restart_ssh_stack() {
+    if [ "$SOCKET_ACTIVE" -eq 1 ]; then
+        run systemctl stop "${SSH_UNIT}.service"
+        # 服务一停，systemd 就把 RuntimeDirectory（/run/sshd）回收了，
+        # 后续 sshd -t / -T 会全数失败，必须立刻补回来
+        ensure_runtime_dir || true
+        run systemctl restart ssh.socket
+    else
+        run systemctl restart "${SSH_UNIT}.service"
+    fi
+}
+
 restart_and_verify() {
     [ ${#DESIRED_CONFIG[@]} -eq 0 ] && return 0
 
     step "校验配置并重启服务"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        note "[DRY-RUN] 将执行: sshd -t && systemctl restart ${SSH_UNIT}.service"
+        if [ "$SOCKET_ACTIVE" -eq 1 ]; then
+            note "[DRY-RUN] 将执行: sshd -t && systemctl stop ${SSH_UNIT}.service && systemctl restart ssh.socket"
+        else
+            note "[DRY-RUN] 将执行: sshd -t && systemctl restart ${SSH_UNIT}.service"
+        fi
         return 0
     fi
 
+    ensure_runtime_dir || true
     sshd -t || die "sshd 配置语法校验失败，已中止（不会重启服务）"
     note "✓ sshd -t 语法校验通过"
 
-    systemctl restart "${SSH_UNIT}.service"
-    if [ "$SOCKET_ACTIVATED" -eq 1 ]; then
-        systemctl restart ssh.socket
-    fi
+    restart_ssh_stack
     sleep 1
 
-    systemctl is-active --quiet "${SSH_UNIT}.service" ||
-        die "${SSH_UNIT}.service 重启后未处于运行状态"
-    note "✓ ${SSH_UNIT}.service 运行中"
+    # socket 激活模式下 sshd 是按需启动的，空闲时 ssh.service 必然是 inactive，
+    # 用它判断存活会把正常状态误判成重启失败，这里要改看 socket 单元。
+    if [ "$SOCKET_ACTIVE" -eq 1 ]; then
+        systemctl is-active --quiet ssh.socket ||
+            die "ssh.socket 重启后未处于监听状态"
+        note "✓ ssh.socket 监听中（sshd 由连接触发启动）"
+    else
+        systemctl is-active --quiet "${SSH_UNIT}.service" ||
+            die "${SSH_UNIT}.service 重启后未处于运行状态"
+        note "✓ ${SSH_UNIT}.service 运行中"
+    fi
 
     local bad
     if ! bad="$(verify_effective_config)"; then
@@ -894,6 +994,11 @@ print_summary() {
 
     printf '  当前生效配置:\n'
     printf '    端口              : %s\n' "${port:-未知}"
+    if [ "$SOCKET_ACTIVE" -eq 1 ]; then
+        printf '    端口来源          : ssh.socket 单元（sshd_config 的 Port 被忽略）\n'
+    elif [ "$SOCKET_ENABLED" -eq 1 ]; then
+        printf '    端口来源          : %s.service；ssh.socket 已启用，重启后接管（已同步配置）\n' "$SSH_UNIT"
+    fi
     printf '    密钥认证          : %s\n' "${pk:-未知}"
     printf '    密码认证          : %s\n' "${pw:-未知}"
     printf '    authorized_keys   : %s\n' "$(authorized_keys_path)"
@@ -920,11 +1025,14 @@ main() {
     check_prerequisites
     detect_ssh_unit
 
+    # 健康检查放在 rollback 之后：配置已经坏掉时，--rollback 正是补救手段，
+    # 不该被这道检查挡在门外
     if [ "$DO_ROLLBACK" -eq 1 ]; then
         do_rollback
         exit 0
     fi
 
+    check_sshd_healthy
     detect_os
 
     printf '%sssh-harden %s%s' "$C_CYA" "$HARDEN_VERSION" "$C_RST"

@@ -2,7 +2,7 @@
 
 一条命令完成 SSH 公钥安装、端口修改、防火墙放行与密码登录禁用。**全程自我校验，任何环节失败自动回滚**，专门针对「远程改 SSH 配置把自己关在门外」这个问题设计。
 
-适用于 Debian / Ubuntu。
+面向 **Debian 12 / 13**。Ubuntu 24.04 也已通过全部测试，但不是主要目标（详见[兼容性说明](#兼容性说明)）。
 
 ## 为什么需要它
 
@@ -129,7 +129,8 @@ sshd 的配置优先级相当微妙：`Include` 指令的位置、drop-in 文件
 
 - **公钥内容逐行校验**：用 `ssh-keygen -l` 验证，URL 返回错误页或 HTML 时直接拒绝，不会把垃圾写进 `authorized_keys`
 - **不做模糊的 sed 替换**：配置精确写入 drop-in 文件。像 `s@.*\(Port \).*@...@` 这类正则会命中所有含关键字的行，包括注释和无关配置
-- **识别 socket 激活**：Ubuntu 22.10+ 默认由 `ssh.socket` 监听端口，此时改 `sshd_config` 的 `Port` 完全无效，必须改 socket 单元
+- **识别 socket 激活**：Ubuntu 22.10+ 默认由 `ssh.socket` 监听端口，此时改 `sshd_config` 的 `Port` 完全无效，端口写入 socket 单元；即使 `ssh.socket` 当前没在监听、只是处于 enabled，也会一并写入——否则改端口当场看着成功，一重启就被 socket 抢回旧值
+- **socket 模式下的重启顺序**：必须先停 `ssh.service` 再重启 `ssh.socket`。顺序反了 systemd 会拒绝（`Socket service ssh.service already active, refusing`），新端口根本不会生效
 - **服务名自适应**：Debian 是 `ssh.service`，其他发行版可能是 `sshd.service`
 - **防火墙自动放行**：识别 ufw / firewalld 并放行新端口。工具不存在或使用 nftables / iptables 时明确警告，而不是静默失败
 - **参数顺序无关**：先解析全部参数，再按固定顺序执行（装密钥 → 改端口 → 放行防火墙 → 禁密码）
@@ -141,11 +142,13 @@ sshd 的配置优先级相当微妙：`Include` 指令的位置、drop-in 文件
 
 序号取 `10` 是为了排在 `50-cloud-init.conf` 等常见 drop-in 之前——sshd 采用**首值优先**，先读到的配置生效。
 
-在 Debian 12 上，`Include /etc/ssh/sshd_config.d/*.conf` 位于主配置**第 12 行**（文件开头），因此 drop-in 天然压过主文件后面的所有设置。前述案例中商家写在第 122 行的 `PubkeyAuthentication no`，会被 drop-in 正确覆盖，无需改动主文件。
+在 Debian 12 与 13 上，`Include /etc/ssh/sshd_config.d/*.conf` 均位于主配置**第 12 行**（文件开头），因此 drop-in 天然压过主文件后面的所有设置。前述案例中商家写在第 122 行的 `PubkeyAuthentication no`，会被 drop-in 正确覆盖，无需改动主文件。
 
 ## 测试
 
-在 Debian 12 容器中完成端到端验证，29 项断言全部通过，包括：
+两套端到端测试，均在容器中完成。
+
+**基础测试**（29 项断言）—— 在 Debian 13、Debian 12、Ubuntu 24.04 上分别验证：
 
 - 复现商家镜像场景（出厂 `PubkeyAuthentication no`），验证脚本能自动开启密钥认证
 - 验证 drop-in 确实压过主配置中的冲突项
@@ -154,17 +157,48 @@ sshd 的配置优先级相当微妙：`Include` 指令的位置、drop-in 文件
 - 改完端口后**真实用密钥登录成功**
 - `--rollback` 完整还原到执行前状态
 
-复现方式：
+```bash
+docker run --rm -v "$PWD:/work:ro" debian:13   bash /work/tests/run-test.sh
+docker run --rm -v "$PWD:/work:ro" debian:12   bash /work/tests/run-test.sh
+docker run --rm -v "$PWD:/work:ro" ubuntu:24.04 bash /work/tests/run-test.sh
+```
+
+**socket 激活测试**（28 项断言）—— 基础测试里 `systemctl` 是模拟的，测不到 socket 单元与
+service 单元的真实交互，因此另起一个带真实 systemd 的容器验证：
+
+- socket 激活模式下改端口真正生效，且经 socket 激活完成真实密钥登录
+- **重启后端口保持不变**（含 `ssh.socket` 仅 enabled、当前未监听的情形）
+- `sshd` 特权分离目录 `/run/sshd` 缺失时能自愈
+- socket 模式下的 `--rollback` 能还原端口且不破坏 socket 激活形态
 
 ```bash
-docker run --rm -v "$PWD:/work:ro" debian:12 bash /work/tests/run-test.sh
+bash tests/run-test-socket.sh debian:13      # 默认镜像即 debian:13
+bash tests/run-test-socket.sh debian:12
+bash tests/run-test-socket.sh ubuntu:24.04
 ```
+
+该测试需要 `docker --privileged`。Ubuntu 上「`ssh.socket` enabled 但 inactive」这一中间态
+因单元依赖无法构造，对应用例会自动跳过。
+
+实测结果：
+
+| | 基础测试 | socket 激活测试 |
+| --- | --- | --- |
+| Debian 13 | 29/29 | 28/28 |
+| Debian 12 | 29/29 | 28/28 |
+| Ubuntu 24.04 | 29/29 | 21/21（跳过 1 组）|
 
 ## 兼容性说明
 
-- 主要针对 Debian / Ubuntu 测试。其他发行版不阻止运行，但遇到无法识别的环境会明确报错中止，而非默默做错。
+- **主要目标是 Debian 12 / 13**，测试与设计均以此为准。
+- **Ubuntu 24.04** 已通过上表全部测试，可以用，但不是主要目标：其他 Ubuntu 版本（22.04、25.x 等）未经验证。
+  需要留意的是，Ubuntu 22.10+ 默认由 `ssh.socket` 监听端口，这条路径的行为与 Debian 差别较大。
+- **上述验证全部在容器中完成，没有真机记录**（Debian 与 Ubuntu 一样）。容器覆盖了真实 systemd
+  与真实密钥登录，但仍不能替代真实 VPS——首次在生产机上使用时，请按[快速开始](#快速开始)里的推荐顺序
+  操作（先不加 `-d`，另开终端验证密钥登录成功后再禁用密码），并保留一个可用的 VNC / 控制台通道。
+- 其他发行版不阻止运行，但会先提示确认；遇到无法识别的环境会明确报错中止，而非默默做错。
 - 使用 nftables / iptables 且存在过滤规则时，脚本**不会**自动改写规则（风险过高），而是提示手动确认端口已放行。
-- 容器测试环境中 `systemctl` 为模拟实现，因此 `ssh.socket` 激活模式的端口改写路径尚未在真实 systemd 环境验证（该路径仅 Ubuntu 22.10+ 默认启用，Debian 12 不受影响）。
+- `ssh.socket` 激活路径已在真实 systemd 环境验证（Debian 12 / 13、Ubuntu 24.04），见上节。
 - 需要 root 权限，以及 `openssh-server` 与 `openssh-client`。
 
 ## 致谢

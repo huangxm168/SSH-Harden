@@ -45,7 +45,6 @@ hash -r
 
 # 生成测试密钥
 ssh-keygen -t ed25519 -f /tmp/testkey -N "" -q
-PUBKEY_FP=$(ssh-keygen -l -f /tmp/testkey.pub | awk '{print $2}')
 
 SCRIPT=/work/ssh-harden.sh
 
